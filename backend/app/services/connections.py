@@ -10,7 +10,7 @@ from ..clock import now
 from ..config import settings
 from ..errors import bad, conflict, not_found
 from ..models import Deliverable, MediaItem, PlatformAccount
-from ..providers.base import TokenInvalid, TokenSet
+from ..providers.base import ProviderError, TokenInvalid, TokenSet
 from ..security import decrypt_token, encrypt_token, read_state, sign_state
 from . import jobs
 from .ops import audit, notify
@@ -19,14 +19,20 @@ PLATFORMS = ("instagram", "youtube")
 
 
 def redirect_uri(platform: str) -> str:
+    if platform == "instagram" and settings.instagram_redirect_uri:
+        return settings.instagram_redirect_uri  # e.g. an HTTPS tunnel registered in the Meta App Dashboard
     return f"{settings.api_origin}/v1/connections/{platform}/callback"
 
 
 def start(db: Session, creator_id: str, platform: str) -> dict:
     if platform not in PLATFORMS:
         raise bad("unsupported_platform", "only Instagram and YouTube are supported")
-    state = sign_state({"uid": creator_id, "platform": platform})
-    return {"url": providers.social(platform, db).authorize_url(state, redirect_uri(platform)), "state": state}
+    mode = providers.social_mode(platform)
+    if mode == "live" and platform == "instagram" and not (settings.instagram_client_id and settings.instagram_client_secret):
+        raise bad("instagram_not_configured", "Set INSTAGRAM_CLIENT_ID and INSTAGRAM_CLIENT_SECRET in backend/.env, then restart the API.")
+    state = sign_state({"uid": creator_id, "platform": platform, "mode": mode})
+    return {"url": providers.social(platform, db).authorize_url(state, redirect_uri(platform)), "state": state,
+            "mode": mode}
 
 
 def callback(db: Session, platform: str, code: str, state: str) -> PlatformAccount:
@@ -36,9 +42,13 @@ def callback(db: Session, platform: str, code: str, state: str) -> PlatformAccou
         raise bad("invalid_state", "connection link expired; start again")
     if st.get("platform") != platform:
         raise bad("invalid_state", "platform mismatch")
-    prov = providers.social(platform, db)
-    tok = prov.exchange_code(code, redirect_uri(platform))
-    prof = prov.profile(tok.access_token)
+    # The mode is fixed when the flow starts, so a code from the simulator is never sent to Meta (and vice versa).
+    prov = providers.social(platform, db, force_live=st.get("mode") == "live", force_fake=st.get("mode") == "fake")
+    try:
+        tok = prov.exchange_code(code, redirect_uri(platform))
+        prof = prov.profile(tok.access_token)
+    except ProviderError as e:
+        raise bad(e.code, str(e) or "the platform rejected the connection")
     if platform == "instagram" and prof.account_type not in ("BUSINESS", "MEDIA_CREATOR"):
         raise bad("personal_account", "Switch to a Creator account in Instagram settings, then connect again.")
     acc = db.query(PlatformAccount).filter_by(platform=platform, external_id=prof.external_id).first()
@@ -75,7 +85,7 @@ def access_token(db: Session, acc: PlatformAccount) -> str:
 
 
 def refresh_account(db: Session, acc: PlatformAccount):
-    prov = providers.social(acc.platform, db)
+    prov = providers.social_for(acc, db)
     tok = TokenSet(decrypt_token(acc.access_token_enc), decrypt_token(acc.refresh_token_enc), acc.token_expires_at,
                    acc.scopes)
     if acc.platform == "instagram" and acc.token_issued_at and now() - acc.token_issued_at < timedelta(hours=24):

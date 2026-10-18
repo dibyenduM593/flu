@@ -17,6 +17,8 @@ def _rid(prefix: str) -> str:
 
 
 class FakeRazorpay:
+    live = False  # settles through create_settlement/settle instead of Route settlement webhooks
+
     def __init__(self, db: Session):
         self.db = db
 
@@ -63,7 +65,7 @@ class FakeRazorpay:
         return self._get(payment_id)
 
     # Route: POST /v1/accounts (+ stakeholders, products)
-    def create_linked_account(self, name: str, email: str | None, bank_tail: str | None) -> dict:
+    def create_linked_account(self, name: str, email: str | None, bank_tail: str | None, **_live_only) -> dict:
         return self._put("account", {"id": _rid("acc"), "entity": "account", "legal_business_name": name,
                                      "email": email, "status": "activated", "bank_tail": bank_tail})
 

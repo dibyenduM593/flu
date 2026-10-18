@@ -20,9 +20,9 @@ router = APIRouter(tags=["webhooks"])
 
 @router.post("/webhooks/razorpay")
 async def razorpay(request: Request, x_razorpay_signature: str | None = Header(default=None),
-                   db: Session = Depends(get_db)):
+                   x_razorpay_event_id: str | None = Header(default=None), db: Session = Depends(get_db)):
     raw = (await request.body()).decode()
-    return money.handle_webhook(db, raw, x_razorpay_signature)
+    return money.handle_webhook(db, raw, x_razorpay_signature, x_razorpay_event_id)
 
 
 def _parse_signed_request(signed: str) -> dict:

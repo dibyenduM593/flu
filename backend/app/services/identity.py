@@ -10,9 +10,11 @@ from ..config import settings
 from ..db import uuid7
 from ..errors import ApiError, bad
 from ..models import CreatorProfile, OrgMember, OtpCode, Org, RefreshToken, User
+from ..providers.base import ProviderError
 from ..security import decode, hash_otp, issue_access, issue_refresh
 
 PHONE_RE = re.compile(r"^\+91[6-9]\d{9}$")
+PROVIDER_VERIFIED = "provider"  # code_hash marker: MSG91 holds the code (MSG91_OTP_VERIFY=msg91)
 
 
 def normalize_phone(phone: str) -> str:
@@ -32,12 +34,17 @@ def send_otp(db: Session, phone: str) -> dict:
                                       OtpCode.created_at >= now() - timedelta(minutes=10)).count()
     if recent >= settings.otp_per_10min:
         raise ApiError(429, "otp_rate_limited", "too many OTP requests; try again in 10 minutes")
-    code = providers.otp().send(phone)
-    db.add(OtpCode(phone=phone, code_hash=hash_otp(phone, code), expires_at=now() + timedelta(minutes=5)))
+    try:
+        code = providers.otp().send(phone)  # None when the provider generates and verifies the code itself
+    except ProviderError as e:
+        raise ApiError(502, "otp_unavailable", "We couldn't send the OTP. Try again in a minute.",
+                       {"provider_code": e.code}) from e
+    db.add(OtpCode(phone=phone, code_hash=hash_otp(phone, code) if code else PROVIDER_VERIFIED,
+                   expires_at=now() + timedelta(minutes=5)))
     db.commit()
     exists = db.query(User).filter_by(phone=phone).first() is not None
     out = {"sent": True, "phone": phone, "existing_user": exists}
-    if settings.dev_mode:
+    if settings.dev_mode and settings.provider_mode != "live" and code:  # never echo a code that went out by SMS
         out["dev_otp"] = code
     return out
 
@@ -59,7 +66,14 @@ def verify_otp(db: Session, phone: str, otp: str, role: str | None) -> dict:
         row.consumed = True
         db.commit()
         raise ApiError(429, "otp_locked", "too many attempts; request a new OTP")
-    if row.code_hash != hash_otp(phone, otp.strip()):
+    try:
+        ok = (providers.otp().verify(phone, otp.strip()) if row.code_hash == PROVIDER_VERIFIED
+              else row.code_hash == hash_otp(phone, otp.strip()))
+    except ProviderError as e:
+        db.commit()  # the attempt still counts
+        raise ApiError(502, "otp_unavailable", "We couldn't check the OTP. Try again in a minute.",
+                       {"provider_code": e.code}) from e
+    if not ok:
         db.commit()
         raise bad("otp_invalid", "incorrect OTP")
     row.consumed = True

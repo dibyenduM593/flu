@@ -242,7 +242,7 @@ def schedule(p: Principal = Depends(creator)):
     best = a.metrics.get("best_hours_ist", []) if a else []
     online = None
     try:
-        online = providers.social(acc.platform, p.db).online_followers(access_token(p.db, acc))
+        online = providers.social_for(acc, p.db).online_followers(access_token(p.db, acc))
     except Exception:
         online = None
     hours = {}
@@ -406,6 +406,14 @@ def earnings(p: Principal = Depends(creator)):
             "kyc": kyc.public(db.get(KycRecord, p.id))}
 
 
+class KycAddress(BaseModel):
+    street1: str
+    street2: str | None = None
+    city: str
+    state: str
+    postal_code: str
+
+
 class KycIn(BaseModel):
     pan: str
     name: str
@@ -413,6 +421,9 @@ class KycIn(BaseModel):
     account_number: str | None = None
     vpa: str | None = None
     gstin: str | None = None
+    # Razorpay Route needs both for the creator's linked account (live mode only).
+    email: str | None = None
+    address: KycAddress | None = None
 
 
 @router.post("/creator/kyc")
@@ -420,7 +431,7 @@ def submit_kyc(body: KycIn, p: Principal = Depends(creator)):
     if not body.vpa and not (body.ifsc and body.account_number):
         raise bad("payout_method_required", "add a bank account (IFSC + number) or a UPI ID")
     rec = kyc.submit(p.db, p.db.get(CreatorProfile, p.id), body.pan, body.name, body.ifsc, body.account_number,
-                     body.vpa, body.gstin)
+                     body.vpa, body.gstin, body.email, body.address.model_dump() if body.address else None)
     return kyc.public(rec)
 
 

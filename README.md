@@ -56,6 +56,45 @@ bought views (held by the anomaly filter) and opens a dispute.
 Also try the Trend Brief Generator (Brands → New brief), Studio (post diagnosis, hooks, posting times), Creator Score,
 and the trust queue (clear or reject held views, decide disputes, clear fraud flags).
 
+## Connect a real Instagram account
+
+Flu uses **Business Login for Instagram** (Instagram API with Instagram Login): a Meta-hosted consent screen opened in
+a popup, with no Facebook Page required. (Meta's "Embedded Signup" is the WhatsApp Business equivalent and doesn't cover
+Instagram.) With `INSTAGRAM_MODE=live`, new Instagram connections go to Meta; payments, KYC, OTP and the seeded demo
+creators stay simulated.
+
+1. **Use a professional account.** In the Instagram app: Settings → Account type and tools → Switch to professional
+   account (Creator or Business). Personal accounts return no data.
+2. **Create a Meta app** at [developers.facebook.com/apps](https://developers.facebook.com/apps): Create app → use case
+   *Manage messaging and content on Instagram* → Business portfolio optional → Create.
+3. **Set up Instagram login.** In the app: Instagram → *API setup with Instagram login*.
+   - Copy the **Instagram app ID** and **Instagram app secret** (not the Facebook app ID).
+   - Step 2 *Generate access tokens* → **Add account** and log in with your Instagram account. In Development mode only
+     accounts added here (or as Instagram Testers under App roles) can connect; no App Review is needed for them.
+   - Step 3 *Set up Instagram business login* → Business login settings → **OAuth redirect URIs**: add
+     `http://127.0.0.1:8000/v1/connections/instagram/callback`. If the dashboard insists on HTTPS, run
+     `cloudflared tunnel --url http://127.0.0.1:8000`, register `https://<the-printed-host>/v1/connections/instagram/callback`
+     instead, and set `INSTAGRAM_REDIRECT_URI` to the same value. Quick-tunnel hosts change each run, so update both.
+4. **Configure Flu.** Create `backend/.env` (it is git-ignored):
+
+   ```
+   INSTAGRAM_MODE=live
+   INSTAGRAM_CLIENT_ID=<Instagram app ID>
+   INSTAGRAM_CLIENT_SECRET=<Instagram app secret>
+   ```
+
+   Restart the API.
+5. **Connect.** Sign up as a new creator with your own number (the OTP shows on screen in dev mode), set up the
+   profile, then Accounts → **Connect Instagram** and approve in the popup. Flu reads your last 30 posts and their
+   insights, runs the audit, and your Creator Score, Studio diagnosis, posting times and Accounts page now reflect your
+   real numbers. Briefs you're hired on are tracked against the real post (post it in the Instagram app, then paste
+   the link).
+
+What it reads: profile (username, account type, followers), the last 30 posts, and per-post `views`, `reach`, `likes`,
+`comments`, `saved`, `shares`. Follower growth and online-follower hours appear only for accounts with 100+ followers.
+The duplicate-comment fraud check is skipped for real accounts because it would need the extra
+`instagram_business_manage_comments` permission. Tokens last 60 days and refresh automatically from day 50.
+
 ## What's implemented (by PRD module)
 
 | Module | In this build |
@@ -77,7 +116,13 @@ Flu's deterministic rules engine, which follows the same rules as the prompts in
 checkout signature, webhooks, Route transfers, settlement), PAN/bank verification and OTP SMS. The consent screen and
 checkout are pages under `/dev/*`. `PROVIDER_MODE=live` switches Instagram and YouTube to the real adapters in
 `backend/app/providers/*_live.py`; these are written against the documented endpoints but are **untested** until Meta App
-Review and Google OAuth verification are granted. Live Razorpay, KYC and MSG91 adapters are not written yet.
+Review and Google OAuth verification are granted. It also switches money and identity to `razorpay_live.py` (Orders, Route
+linked accounts, on-hold transfers, release, reversals, settlement lookups), `kyc_live.py` (Cashfree PAN, bank account and
+UPI verification, name match ≥ 0.8) and `otp_live.py` (MSG91 OTP), which are tested only against `httpx.MockTransport`.
+Route can release a held transfer only whole, so in live mode each hire's escrow is split into slices: slices are released
+as batches are finalized, never ahead of the ledger's net, and closing a hire releases the exact remainder and reverses
+the rest. Payouts are marked paid from the `settlement.processed` / `transfer.processed` webhooks, with an hourly poll as a
+fallback. In live mode `/v1/dev` is not mounted and the OTP is never echoed in the response.
 
 ## Not done yet
 
@@ -95,9 +140,11 @@ Review and Google OAuth verification are granted. Live Razorpay, KYC and MSG91 a
 cd backend && .venv/Scripts/python -m pytest -q
 ```
 
-16 tests: the ledger invariants (balances never negative, releases never exceed the reserve, idempotent and sign-checked
+52 tests: the ledger invariants (balances never negative, releases never exceed the reserve, idempotent and sign-checked
 posting), a property test on CPM accrual against the cap, TDS 194-O, the A6 anomaly rules, the fraud screen, score bounds
-and tiers, and an HTTP walk-through of apply → hire with an idempotency key → contract → submission checks.
+and tiers, and an HTTP walk-through of apply → hire with an idempotency key → contract → submission checks. The live
+Razorpay, Cashfree and MSG91 adapters run against `httpx.MockTransport`, including live-mode escrow end to end
+(`tests/test_money_live.py`, with an in-memory Razorpay in `tests/razorpay_mock.py`); nothing calls a real account.
 
 ## Layout
 

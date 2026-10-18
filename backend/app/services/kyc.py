@@ -4,19 +4,35 @@ from sqlalchemy.orm import Session
 from .. import providers
 from ..clock import now
 from ..errors import ApiError
-from ..models import CreatorProfile, KycRecord, Org
+from ..models import CreatorProfile, KycRecord, Org, User
+from ..providers.base import ProviderError, ProviderUnavailable
 from ..security import hash_pan
 from .money import release_kyc_holds
 from .ops import audit, open_item
 
+NAME_MATCH_MIN = 0.8
+LINKED_ACCOUNT_ERRORS = {
+    "bank_account_required": "Payouts need a bank account (IFSC + number); UPI-only payouts aren't supported yet.",
+    "email_required": "Add an email address to receive payouts.",
+    "address_required": "Add your address (street, city, state, PIN code) to receive payouts.",
+}
+
+
+def _call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except ProviderUnavailable as e:
+        raise ApiError(502, "kyc_provider_unavailable", "Verification is temporarily unavailable. Try again in a few minutes.",
+                       {"provider_code": e.code}) from e
+
 
 def submit(db: Session, cp: CreatorProfile, pan: str, name: str, ifsc: str | None, account_number: str | None,
-           vpa: str | None, gstin: str | None) -> KycRecord:
+           vpa: str | None, gstin: str | None, email: str | None = None, address: dict | None = None) -> KycRecord:
     k = providers.kyc()
     rec = db.get(KycRecord, cp.user_id) or KycRecord(creator_id=cp.user_id)
     db.add(rec)
     pan = (pan or "").upper().strip()
-    res = k.verify_pan(pan, name)
+    res = _call(k.verify_pan, pan, name)
 
     def fail(reason: str, msg: str):
         rec.status, rec.fail_reason = "failed", reason
@@ -28,11 +44,13 @@ def submit(db: Session, cp: CreatorProfile, pan: str, name: str, ifsc: str | Non
 
     if not res["valid"]:
         fail(res["reason"], "That PAN doesn't look right. Check the 10 characters on your card.")
-    if res["name_match"] < 0.8:
+    if res["name_match"] < NAME_MATCH_MIN:
         fail("pan_name_mismatch", "The name doesn't match the PAN records. Use the name exactly as on your PAN.")
-    bank = k.penny_drop(ifsc, account_number, vpa, name)
+    bank = _call(k.penny_drop, ifsc, account_number, vpa, name)
     if not bank["valid"]:
         fail(bank["reason"], "We couldn't verify that bank account or UPI ID.")
+    if bank.get("name_match", 1.0) < NAME_MATCH_MIN:
+        fail("bank_name_mismatch", "The name on that bank account or UPI ID doesn't match your PAN name.")
     digest, salt = hash_pan(pan)
     rec.pan_hash, rec.pan_salt, rec.pan_last4, rec.pan_name = digest, salt, pan[-4:], name
     rec.name_match, rec.bank_verified = res["name_match"], True
@@ -42,7 +60,17 @@ def submit(db: Session, cp: CreatorProfile, pan: str, name: str, ifsc: str | Non
     rec.gstin = gstin or None
     rec.fund_account_id, rec.provider_ref = bank["ref"], res["ref"]
     if not rec.linked_account_id:
-        acc = providers.razorpay(db).create_linked_account(name, None, rec.account_tail)
+        user = db.get(User, cp.user_id)
+        if email:
+            user.email = email
+        try:
+            acc = _call(providers.razorpay(db).create_linked_account, name, user.email, rec.account_tail,
+                        phone=user.phone, pan=pan, ifsc=rec.ifsc, account_number=account_number, reference_id=cp.user_id,
+                        address=address)
+        except ProviderError as e:
+            open_item(db, "kyc_fail", e.code, "creator", cp.user_id, f"Route linked account setup failed for {cp.display_name}",
+                      {"provider_message": str(e)[:300]})
+            fail(e.code, LINKED_ACCOUNT_ERRORS.get(e.code, "We couldn't set up payouts to that account."))
         rec.linked_account_id = acc["id"]
     rec.status, rec.fail_reason, rec.verified_at = "verified", None, now()
     cp.kyc_status = "verified"

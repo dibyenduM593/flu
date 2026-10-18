@@ -29,7 +29,7 @@ function Consent() {
       setBusy(false);
     }
   };
-  const cancel = () => { window.location.href = `${p.get("redirect_uri")}?error=cancelled&state=${p.get("state")}`; };
+  const cancel = () => { window.location.href = `${p.get("redirect_uri")}?error=access_denied&state=${p.get("state")}`; };
   return (
     <div style={{ minHeight: "100dvh", display: "grid", placeItems: "center", padding: 16 }}>
       <div className="card stack-lg" style={{ width: "min(460px, 100%)", padding: 28 }}>

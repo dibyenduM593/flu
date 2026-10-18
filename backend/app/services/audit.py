@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from .. import providers
 from ..clock import now
 from ..models import AccountAudit, CreatorProfile, MediaItem, PlatformAccount
-from ..providers.base import MediaGone, TokenInvalid
+from ..providers.base import MediaGone, ProviderError, TokenInvalid
 from . import jobs
 from .connections import access_token, mark_needs_reauth
 from .ops import notify, open_item
@@ -29,7 +29,7 @@ def _week_key(dt):
 
 
 def sync_media(db: Session, acc: PlatformAccount, limit: int = 30) -> list[MediaItem]:
-    prov = providers.social(acc.platform, db)
+    prov = providers.social_for(acc, db)
     tok = access_token(db, acc)
     prof = prov.profile(tok)
     acc.follower_count = prof.followers
@@ -48,6 +48,10 @@ def sync_media(db: Session, acc: PlatformAccount, limit: int = 30) -> list[Media
             row.metrics_fetched_at = now()
         except MediaGone:
             continue
+        except TokenInvalid:
+            raise
+        except ProviderError:
+            pass  # e.g. a post type with no insights: still counts for cadence, not for performance medians
         items.append(row)
     acc.last_synced_at = now()
     db.flush()
@@ -61,6 +65,8 @@ def compute_metrics(items: list[MediaItem], followers: int, followers_30d_ago: i
     hour_n = Counter()
     for m in items:
         x = m.last_metrics or {}
+        if not x:
+            continue  # no insights for this post; it only counts toward cadence below
         v, r = x.get("views", 0), max(x.get("reach", 0), 1)
         e = x.get("likes", 0) + x.get("comments", 0) + x.get("saves", 0) + x.get("shares", 0)
         eng.append(e / r)
@@ -83,7 +89,8 @@ def compute_metrics(items: list[MediaItem], followers: int, followers_30d_ago: i
     sv = sorted(views)
     q = lambda p: sv[min(len(sv) - 1, int(p * len(sv)))] if sv else 0
     return {
-        "posts_analysed": len(items),
+        "posts_analysed": len(views),
+        "posts_without_insights": len(items) - len(views),
         "followers": followers,
         "engagement_rate": round(_median(eng), 4),
         "median_views": int(_median(views)),
@@ -142,7 +149,12 @@ def run(db: Session, platform_account_id: str):
         return
     metrics = compute_metrics(items, prof.followers, prof.followers_30d_ago)
     top = sorted(items, key=lambda m: (m.last_metrics or {}).get("views", 0), reverse=True)[:3]
-    comments = [c for m in top for c in prov.comment_sample(tok, m.external_media_id)]
+    comments = []
+    for m in top:
+        try:
+            comments += prov.comment_sample(tok, m.external_media_id)
+        except ProviderError:
+            pass  # comment text needs instagram_business_manage_comments; the duplicate check is skipped without it
     flags = fraud_screen(metrics, comments)
     result = "flag" if flags else "pass"
     audit_row = AccountAudit(platform_account_id=acc.id, metrics=metrics, fraud_flags=flags, result=result)

@@ -44,7 +44,8 @@ app.add_middleware(CORSMiddleware, allow_origins=[settings.web_origin], allow_cr
                    allow_methods=["*"], allow_headers=["*"])
 for r in (auth.router, creator.router, brand.router, ops.router, webhooks.router):
     app.include_router(r)
-if settings.dev_mode:
+if settings.dev_mode and settings.provider_mode != "live":
+    # The simulator signs fake payment.captured webhooks with the real secret; with live Razorpay it would mint balance.
     from .routers import dev
     app.include_router(dev.router)
 

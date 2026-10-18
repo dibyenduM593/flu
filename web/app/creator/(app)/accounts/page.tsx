@@ -14,6 +14,8 @@ const ERR: Record<string, string> = {
   account_taken: "That account is already connected to another Flu creator.",
   invalid_state: "The connection link expired. Start again.",
   cancelled: "Connection cancelled.",
+  insights_not_granted: "Flu needs permission to read your post insights. Connect again and leave that permission on.",
+  instagram_not_configured: "Instagram isn’t set up on this server yet (missing app ID and secret).",
 };
 
 const FLAG: Record<string, string> = {
@@ -29,28 +31,46 @@ function Accounts() {
   const { toast, refreshMe } = useSession();
   const [busy, setBusy] = useState<string | null>(null);
 
-  useEffect(() => {
-    const c = params.get("connected"), e = params.get("error");
-    if (c) {
-      toast(`Connected @${params.get("handle")}. Running your audit…`);
+  const handleResult = (r: { connected?: string | null; handle?: string | null; error?: string | null; message?: string | null }) => {
+    setBusy(null);
+    if (r.connected) {
+      toast(`Connected @${r.handle}. Reading your last 30 posts…`);
       const t = setInterval(reload, 1500);
-      setTimeout(() => { clearInterval(t); refreshMe(); }, 9000);
-      router.replace("/creator/accounts");
-      return () => clearInterval(t);
+      setTimeout(() => { clearInterval(t); reload(); refreshMe(); }, 15000);
+    } else if (r.error) {
+      toast(ERR[r.error] || r.message || r.error, "error");
     }
-    if (e) {
-      toast(ERR[e] || e, "error");
+  };
+
+  useEffect(() => {
+    // Full-page fallback (popup blocked): /connect/done redirects here with the result in the query string.
+    const c = params.get("connected"), e = params.get("error");
+    if (c || e) {
+      handleResult({ connected: c, handle: params.get("handle"), error: e, message: params.get("message") });
       router.replace("/creator/accounts");
     }
+    const onMessage = (ev: MessageEvent) => {
+      if (ev.origin === window.location.origin && ev.data?.type === "flu:connect") handleResult(ev.data);
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const connect = async (platform: string) => {
     setBusy(platform);
+    // Open the window inside the click so popup blockers allow it, then point it at the consent screen.
+    const w = window.open("", "flu-connect", "popup,width=520,height=760");
     try {
       const r = await api(`/v1/connections/${platform}/start`, { method: "POST" });
-      window.location.href = r.url;
+      if (w) {
+        w.location.href = r.url;
+        const closed = setInterval(() => { if (w.closed) { clearInterval(closed); setBusy(null); } }, 700);
+      } else {
+        window.location.href = r.url;
+      }
     } catch (e: any) {
+      w?.close();
       toast(e.message, "error");
       setBusy(null);
     }

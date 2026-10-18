@@ -1,3 +1,5 @@
+from urllib.parse import urlencode
+
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
@@ -71,14 +73,15 @@ def connection_start(platform: str, p: Principal = Depends(creator)):
 @router.get("/connections/{platform}/callback", include_in_schema=True)
 def connection_callback(platform: str, code: str | None = None, state: str | None = None,
                         error: str | None = None, db: Session = Depends(get_db)):
-    dest = f"{settings.web_origin}/creator/accounts"
+    # /connect/done hands the result to the window that opened the consent popup (or redirects when there is none).
+    dest = f"{settings.web_origin}/connect/done"
     if error or not code or not state:
-        return RedirectResponse(f"{dest}?error={error or 'cancelled'}")
+        return RedirectResponse(f"{dest}?" + urlencode({"platform": platform, "error": "cancelled" if error in (None, "access_denied") else error}))
     try:
         acc = connections.callback(db, platform, code, state)
     except ApiError as e:
-        return RedirectResponse(f"{dest}?error={e.code}")
-    return RedirectResponse(f"{dest}?connected={platform}&handle={acc.handle}")
+        return RedirectResponse(f"{dest}?" + urlencode({"platform": platform, "error": e.code, "message": e.message}))
+    return RedirectResponse(f"{dest}?" + urlencode({"platform": platform, "connected": platform, "handle": acc.handle}))
 
 
 @router.get("/connections")

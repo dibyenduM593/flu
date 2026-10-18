@@ -89,7 +89,7 @@ def connect(db, uid: str, platform: str, handle: str, overrides: dict):
     from .models import FakeAccount
     acc = db.query(FakeAccount).filter_by(platform=platform, handle=handle).first()
     connections.callback(db, platform, _FakeBase.issue_code(acc.external_id),
-                         sign_state({"uid": uid, "platform": platform}))
+                         sign_state({"uid": uid, "platform": platform, "mode": "fake"}))
 
 
 def topup(db, org: Org, rupees: int, actor: str):

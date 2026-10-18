@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from .. import providers
 from ..clock import now
 from ..models import (Brief, Deliverable, Hire, MediaItem, OrgMember, PlatformAccount, ViewLedger, ViewSnapshot)
-from ..providers.base import MediaGone, TokenInvalid
+from ..providers.base import MediaGone, ProviderError, TokenInvalid
 from . import jobs
 from .connections import access_token, mark_needs_reauth
 from .ops import notify, open_item
@@ -91,7 +91,7 @@ def poll(db: Session, deliverable_id: str):
     brief = db.get(Brief, hire.brief_id)
     media = db.get(MediaItem, d.media_item_id)
     acc = db.get(PlatformAccount, media.platform_account_id)
-    prov = providers.social(acc.platform, db)
+    prov = providers.social_for(acc, db)
     t = now()
     try:
         if acc.platform == "instagram":
@@ -113,6 +113,11 @@ def poll(db: Session, deliverable_id: str):
             notify(db, m.user_id, "post_deleted", f"A post on “{brief.title}” was deleted or made private.",
                    f"/brand/briefs/{brief.id}")
         close_hire_if_done(db, hire)
+        db.commit()
+        return
+    except ProviderError:
+        # Rate limit, outage or a transient Graph error: skip this read; the next scheduled poll catches up.
+        schedule_next(db, d, t)
         db.commit()
         return
     snaps = (db.query(ViewSnapshot).filter_by(deliverable_id=d.id).order_by(ViewSnapshot.polled_at).all())

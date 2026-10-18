@@ -275,7 +275,7 @@ def submit(db: Session, hire: Hire, creator_id: str, post_url: str, hook_id: str
     if not acc:
         raise bad("not_connected", f"connect your {platform.title()} account first")
     from .connections import access_token
-    prov = providers.social(platform, db)
+    prov = providers.social_for(acc, db)
     m = prov.find_media_by_permalink(access_token(db, acc), url)
     if not m:
         raise ApiError(422, "ownership_failed", f"We couldn't find this post on @{acc.handle}. Post from your connected account.")

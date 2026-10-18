@@ -100,6 +100,8 @@ def publish(body: PublishIn, p: Principal = Depends(creator)):
     if not acc:
         raise bad("not_connected", f"connect {body.platform} first")
     fa = p.db.get(FakeAccount, acc.external_id)
+    if fa is None:
+        raise bad("live_account", f"@{acc.handle} is a real {body.platform.title()} account: post from the app, then paste the link.")
     from ..providers.fake_world import create_post
     m = create_post(p.db, fa, body.caption, posted_at=clock.now() - timedelta(minutes=2),
                     seed=f"live:{fa.handle}:{clock.now().isoformat()}", quality_boost=max(0.3, min(body.quality, 3)),

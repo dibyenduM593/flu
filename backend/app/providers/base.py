@@ -8,6 +8,10 @@ class ProviderError(Exception):
         self.code = code
 
 
+class ProviderUnavailable(ProviderError):
+    """Timeout, 5xx, rate limit or rejected credentials: retry later, never a verdict on the user's data."""
+
+
 class MediaGone(ProviderError):
     """Post deleted or made private (TR-4)."""
 

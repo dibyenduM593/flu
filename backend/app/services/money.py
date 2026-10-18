@@ -16,6 +16,7 @@ A release of gross P posts release_reserve +(P+G) and payout/fee/fee_gst/tds sum
 release never changes `available`; only the final close of a hire returns unspent reserve.
 """
 import csv
+import hashlib
 import io
 import json
 from datetime import datetime, timedelta
@@ -30,11 +31,13 @@ from ..config import (GST_RATE, GST_REQUIRED_TOPUP_PAISE, MIN_TOPUP_PAISE, TAKE_
 from ..errors import ApiError, bad, conflict, not_found
 from ..models import (Brief, CreatorProfile, Deliverable, Hire, KycRecord, LedgerEntry, Org, OrgMember, Payment, Payout,
                       Transfer, ViewLedger, Wallet, WebhookEvent)
+from ..providers.base import ProviderError
 from ..security import verify_hmac
 from . import jobs
 from .ops import audit, notify, open_item
 from .audit import IST
 
+RZP_MIN_TRANSFER_PAISE = 100
 SIGNS = {"topup": 1, "reserve": -1, "release_reserve": 1, "payout": -1, "fee": -1, "fee_gst": -1,
          "tds_withheld": -1, "refund": -1}
 
@@ -129,10 +132,11 @@ def verify_checkout(db: Session, order_id: str, payment_id: str, signature: str)
     return ok
 
 
-def handle_webhook(db: Session, raw_body: str, signature: str | None) -> dict:
+def handle_webhook(db: Session, raw_body: str, signature: str | None, event_id: str | None = None) -> dict:
+    """`event_id` is the X-Razorpay-Event-Id header; live payloads carry no id of their own."""
     verified = verify_hmac(settings.razorpay_webhook_secret, raw_body, signature or "")
     data = json.loads(raw_body)
-    evt_id = data.get("id") or f"noid_{hash(raw_body)}"
+    evt_id = event_id or data.get("id") or "noid_" + hashlib.sha256(raw_body.encode()).hexdigest()[:40]
     if db.get(WebhookEvent, evt_id):
         return {"status": "duplicate"}
     db.add(WebhookEvent(id=evt_id, provider="razorpay", event=data.get("event", "?"), payload=data, verified=verified))
@@ -155,8 +159,33 @@ def handle_webhook(db: Session, raw_body: str, signature: str | None) -> dict:
         p = db.query(Payment).filter_by(rzp_order_id=pay["order_id"]).first()
         if p:
             p.status = "failed"
+    elif event.startswith(("transfer.", "settlement.")):
+        _route_event(db, event, data["payload"])
     db.commit()
     return {"status": "processed", "event": event}
+
+
+def _route_event(db: Session, event: str, payload: dict):
+    """Live Route: a released transfer settles to the creator's bank with the linked account's next settlement.
+    The simulator never sends these; it settles through settle_payouts instead."""
+    rzp = providers.razorpay(db)
+    if not rzp.live:
+        return
+    if event == "settlement.processed":
+        s = payload["settlement"]["entity"]
+        # Also fires for Flu's own settlements; those contain no Route transfers and match nothing.
+        ids = {t["id"] for t in rzp.settlement_transfers(s["id"])}
+        _mark_settled(db, ids, s.get("utr"))
+    elif event == "transfer.processed":
+        t = payload["transfer"]["entity"]
+        if t.get("recipient_settlement_id"):
+            s = rzp.transfer_settlement(t["id"])
+            if s and s.get("utr"):
+                _mark_settled(db, {t["id"]}, s["utr"])
+    elif event == "transfer.failed":
+        t = payload["transfer"]["entity"]
+        open_item(db, "reconcile", "transfer_failed", "transfer", t["id"],
+                  f"Route transfer {t['id']} failed", {"error": t.get("error"), "notes": t.get("notes")})
 
 
 def refund(db: Session, org: Org, payment_id: str, amount_paise: int, actor: str) -> dict:
@@ -191,9 +220,16 @@ def ensure_transfers(db: Session, hire: Hire):
     if not kyc or not kyc.linked_account_id:
         return
     brief = db.get(Brief, hire.brief_id)
-    have = sum(t.amount_paise for t in db.query(Transfer).filter_by(hire_id=hire.id).all())
-    need = per_deliverable_cap(brief) * brief.deliverables_per_creator - have
     rzp = providers.razorpay(db)
+    db.flush()
+    ts = db.query(Transfer).filter_by(hire_id=hire.id).all()
+    if rzp.live:
+        # A closed hire only needs to cover what the creator is still owed (a KYC hold cleared after close).
+        have = sum(t.amount_paise - t.reversed_paise for t in ts)
+        closed = hire.status in ("completed", "cancelled")
+        need = (owed_net(db, hire) if closed else per_deliverable_cap(brief) * brief.deliverables_per_creator) - have
+    else:
+        need = per_deliverable_cap(brief) * brief.deliverables_per_creator - sum(t.amount_paise for t in ts)
     for p in db.query(Payment).filter_by(org_id=brief.org_id, status="captured").order_by(Payment.captured_at).all():
         if need <= 0:
             break
@@ -203,10 +239,104 @@ def ensure_transfers(db: Session, hire: Hire):
         if free <= 0:
             continue
         amt = min(free, need)
-        t = rzp.create_transfer(p.rzp_payment_id, kyc.linked_account_id, amt, {"hire_id": hire.id}, on_hold=True)
-        db.add(Transfer(hire_id=hire.id, payment_id=p.id, rzp_transfer_id=t["id"], amount_paise=amt, on_hold=True))
-        need -= amt
+        if not rzp.live:
+            t = rzp.create_transfer(p.rzp_payment_id, kyc.linked_account_id, amt, {"hire_id": hire.id}, on_hold=True)
+            db.add(Transfer(hire_id=hire.id, payment_id=p.id, rzp_transfer_id=t["id"], amount_paise=amt, on_hold=True))
+            need -= amt
+            continue
+        for part in escrow_slices(amt):
+            try:
+                t = rzp.create_transfer(p.rzp_payment_id, kyc.linked_account_id, part, {"hire_id": hire.id}, on_hold=True)
+            except ProviderError as e:
+                # e.g. the linked account isn't activated yet; the next finalize or KYC change retries.
+                open_item(db, "reconcile", "transfer_create_failed", "hire", hire.id,
+                          f"Route escrow transfer failed for hire {hire.id}: {e.code}", {"message": str(e)[:300]})
+                db.flush()
+                return
+            db.add(Transfer(hire_id=hire.id, payment_id=p.id, rzp_transfer_id=t["id"], amount_paise=part, on_hold=True))
+            need -= part
     db.flush()
+
+
+def escrow_slices(amount: int) -> list[int]:
+    """Route releases a held transfer only in full, so live escrow is split into slices that can be released as
+    the creator earns: at most RAZORPAY_ESCROW_MAX_SLICES per chunk, none smaller than the minimum."""
+    if amount < RZP_MIN_TRANSFER_PAISE:
+        return []
+    size = max(settings.razorpay_escrow_min_slice_paise, -(-amount // settings.razorpay_escrow_max_slices))
+    parts = [size] * (amount // size)
+    rest = amount % size
+    if rest and parts and rest < RZP_MIN_TRANSFER_PAISE:
+        parts[-1] += rest
+    elif rest:
+        parts.append(rest)
+    return parts
+
+
+def owed_net(db: Session, hire: Hire) -> int:
+    """Net the creator has been paid or is owed on a hire: every finalized batch, settled or not."""
+    db.flush()
+    ids = [d for (d,) in db.query(Deliverable.id).filter_by(hire_id=hire.id).all()]
+    return int(db.query(func.coalesce(func.sum(Payout.net_paise), 0))
+               .filter(Payout.deliverable_id.in_(ids or [""]), Payout.status.in_(["processing", "processed"])).scalar())
+
+
+def route_sync(db: Session, rzp, hire: Hire):
+    """Live Route. Release held slices, oldest first, while the creator is owed at least the next slice; the rest
+    waits for the next batch. Once the hire is closed, trim the next slice to the exact remainder and reverse every
+    other held rupee (Flu's fee, TDS and unspent reserve) back out of escrow. The creator never receives more
+    than owed_net, which is what the ledger paid out."""
+    owed = owed_net(db, hire)
+    ts = db.query(Transfer).filter_by(hire_id=hire.id).order_by(Transfer.created_at, Transfer.id).all()
+    released = sum(t.amount_paise - t.reversed_paise for t in ts if not t.on_hold)
+    closed = hire.status in ("completed", "cancelled")
+    for t in ts:
+        held = t.amount_paise - t.reversed_paise
+        if not t.on_hold or held <= 0:
+            continue
+        due = owed - released
+        if held > due:
+            if not closed:
+                break
+            # Read the provider's reversed amount first so a retried close never reverses the same rupee twice.
+            t.reversed_paise = int(rzp.get_transfer(t.rzp_transfer_id).get("amount_reversed") or 0)
+            held, keep = t.amount_paise - t.reversed_paise, max(due, 0)
+            if held > keep:
+                rzp.reverse_transfer(t.rzp_transfer_id, held - keep)  # POST /v1/transfers/{id}/reversals
+                t.reversed_paise += held - keep
+                held = keep
+            if not held:
+                continue
+        rzp.release_transfer(t.rzp_transfer_id)  # PATCH /v1/transfers/{id} {on_hold:false}
+        t.on_hold = False
+        released += held
+    db.flush()
+    # Point each batch at the released transfer that completes it, so its settlement can mark the batch paid.
+    out = [t for t in ts if not t.on_hold and t.amount_paise > t.reversed_paise]
+    i = covered = cum = 0
+    ids = [d for (d,) in db.query(Deliverable.id).filter_by(hire_id=hire.id).all()]
+    for p in db.query(Payout).filter(Payout.deliverable_id.in_(ids or [""]), Payout.status.in_(["processing", "processed"])) \
+            .order_by(Payout.created_at, Payout.id).all():
+        cum += p.net_paise
+        while covered < cum and i < len(out):
+            covered += out[i].amount_paise - out[i].reversed_paise
+            i += 1
+        if covered < cum:
+            break
+        if not p.rzp_transfer_id:
+            p.rzp_transfer_id = out[i - 1].rzp_transfer_id
+
+
+def _paid(db: Session, p: Payout, utr: str | None):
+    p.status, p.utr, p.processed_at = "processed", utr, now()
+    notify(db, p.creator_id, "payout_sent", f"₹{p.net_paise / 100:,.2f} sent to your bank. UTR {p.utr}.",
+           "/creator/earnings")
+
+
+def _mark_settled(db: Session, rzp_transfer_ids: set[str], utr: str | None):
+    for p in db.query(Payout).filter(Payout.status == "processing",
+                                     Payout.rzp_transfer_id.in_(rzp_transfer_ids or [""])).all():
+        _paid(db, p, utr)
 
 
 # ------------------------------------------------------------------ accrual + release
@@ -301,17 +431,23 @@ def finalize(db: Session, p: Payout, actor: str | None = None):
     if p.tds_paise:
         post(db, org.id, "tds_withheld", -p.tds_paise, "payout", p.id, f"{k}:tds", "TDS u/s 194-O", actor)
     rzp = providers.razorpay(db)
-    ensure_transfers(db, hire)
-    for t in db.query(Transfer).filter_by(hire_id=hire.id, on_hold=True).all():
-        rzp.release_transfer(t.rzp_transfer_id)  # PATCH /v1/transfers/{id} {on_hold:false}
-        t.on_hold = False
-    kyc = db.get(KycRecord, p.creator_id)
-    s = rzp.create_settlement(kyc.linked_account_id, p.net_paise, {"payout_id": p.id})
+    if rzp.live:
+        # Settles when the released transfer reaches the creator's bank (settlement webhook or settle_payouts).
+        p.status = "processing"
+        ensure_transfers(db, hire)
+        route_sync(db, rzp, hire)
+    else:
+        ensure_transfers(db, hire)
+        for t in db.query(Transfer).filter_by(hire_id=hire.id, on_hold=True).all():
+            rzp.release_transfer(t.rzp_transfer_id)  # PATCH /v1/transfers/{id} {on_hold:false}
+            t.on_hold = False
+        kyc = db.get(KycRecord, p.creator_id)
+        p.rzp_transfer_id = rzp.create_settlement(kyc.linked_account_id, p.net_paise, {"payout_id": p.id})["id"]
     seq = db.query(Payout).filter(Payout.invoice_no.isnot(None)).count() + 1
     t = now().astimezone(IST)
     fy = f"{t.year % 100}-{t.year % 100 + 1}" if t.month >= 4 else f"{t.year % 100 - 1}-{t.year % 100}"
     p.invoice_no = f"FLU/{fy}/{seq:06d}"
-    p.rzp_transfer_id, p.status, p.hold_reason = s["id"], "processing", None
+    p.status, p.hold_reason = "processing", None
     p.settle_after = now() + timedelta(hours=36)  # Route settles T+1 to T+3
     audit(db, actor, "payout.released", "payout", p.id, None,
           {"gross": p.amount_paise, "fee": p.fee_paise, "gst": p.gst_paise, "tds": p.tds_paise, "net": p.net_paise})
@@ -346,7 +482,12 @@ def close_hire_if_done(db: Session, hire: Hire, actor: str | None = None, force:
     if leftover > 0:
         post(db, brief.org_id, "release_reserve", leftover, "hire", hire.id, f"close:{hire.id}",
              "Unspent reserve returned", actor)
+    hire.status = "cancelled" if force and not ds else "completed"
+    hire.closed_at = now()
     rzp = providers.razorpay(db)
+    if rzp.live:
+        route_sync(db, rzp, hire)  # pays out the exact remainder, reverses the rest
+        return
     used = sum(p.amount_paise for p in db.query(Payout).filter(Payout.deliverable_id.in_([d.id for d in ds] or [""])).all())
     for t in db.query(Transfer).filter_by(hire_id=hire.id).all():
         spare = t.amount_paise - t.reversed_paise - min(used, t.amount_paise)
@@ -354,8 +495,6 @@ def close_hire_if_done(db: Session, hire: Hire, actor: str | None = None, force:
         if spare > 0:
             rzp.reverse_transfer(t.rzp_transfer_id, spare)  # POST /v1/transfers/{id}/reversals
             t.reversed_paise += spare
-    hire.status = "cancelled" if force and not ds else "completed"
-    hire.closed_at = now()
 
 
 # ------------------------------------------------------------------ recurring jobs
@@ -387,24 +526,51 @@ def auto_approve_sweep(db: Session):
 @jobs.task("money.settle_payouts")
 def settle_payouts(db: Session):
     rzp = providers.razorpay(db)
-    for p in db.query(Payout).filter(Payout.status == "processing", Payout.settle_after <= now()).all():
-        s = rzp.settle(p.rzp_transfer_id)
-        p.status, p.utr, p.processed_at = "processed", s["utr"], now()
-        notify(db, p.creator_id, "payout_sent", f"₹{p.net_paise / 100:,.2f} sent to your bank. UTR {p.utr}.",
-               "/creator/earnings")
+    due = db.query(Payout).filter(Payout.status == "processing", Payout.settle_after <= now())
+    if rzp.live:
+        # Settlement webhooks normally get here first; this catches any that were missed.
+        seen: dict[str, dict | None] = {}
+        for p in due.filter(Payout.rzp_transfer_id.isnot(None)).all():
+            if p.rzp_transfer_id not in seen:
+                seen[p.rzp_transfer_id] = rzp.transfer_settlement(p.rzp_transfer_id)
+            s = seen[p.rzp_transfer_id]
+            if s and s.get("utr"):
+                _paid(db, p, s["utr"])
+    else:
+        for p in due.all():
+            _paid(db, p, rzp.settle(p.rzp_transfer_id)["utr"])
     db.commit()
 
 
 @jobs.task("money.reconcile")
 def reconcile(db: Session) -> dict:
-    """Daily: ledger payouts must equal provider settlements; top-ups must equal captured payments."""
+    """Daily: ledger payouts must equal provider settlements (live: every Route transfer must match the provider's
+    amount, reversals and hold); top-ups must equal captured payments."""
     rzp = providers.razorpay(db)
-    settled = {s["notes"].get("payout_id"): s for s in rzp.list("settlement")}
     issues = []
-    for p in db.query(Payout).filter(Payout.status.in_(["processing", "processed"])).all():
-        s = settled.get(p.id)
-        if not s or s["amount"] != p.net_paise:
-            issues.append({"payout_id": p.id, "ledger_net": p.net_paise, "provider": s and s["amount"]})
+    if rzp.live:
+        remote = {t["id"]: t for t in rzp.list("transfer")}
+        local = db.query(Transfer).all()
+        known = {t.rzp_transfer_id for t in local}
+        for r in remote.values():
+            if r["id"] not in known:  # e.g. created at Razorpay, then our transaction rolled back
+                issues.append({"rzp_transfer_id": r["id"], "ledger": None,
+                               "provider": {"amount": r["amount"], "on_hold": r.get("on_hold"), "notes": r.get("notes")}})
+        for t in local:
+            r = remote.get(t.rzp_transfer_id)
+            held = t.amount_paise > t.reversed_paise  # a fully reversed transfer's hold flag no longer matters
+            mine = {"amount": t.amount_paise, "amount_reversed": t.reversed_paise, "on_hold": t.on_hold if held else None}
+            theirs = r and {"amount": r["amount"], "amount_reversed": r.get("amount_reversed") or 0,
+                            "on_hold": bool(r.get("on_hold")) if held else None}
+            if mine != theirs:
+                issues.append({"rzp_transfer_id": t.rzp_transfer_id, "ledger": mine, "provider": theirs})
+        settled = remote
+    else:
+        settled = {s["notes"].get("payout_id"): s for s in rzp.list("settlement")}
+        for p in db.query(Payout).filter(Payout.status.in_(["processing", "processed"])).all():
+            s = settled.get(p.id)
+            if not s or s["amount"] != p.net_paise:
+                issues.append({"payout_id": p.id, "ledger_net": p.net_paise, "provider": s and s["amount"]})
     topups = int(db.query(func.coalesce(func.sum(LedgerEntry.amount_paise), 0)).filter(LedgerEntry.kind == "topup").scalar())
     captured = int(db.query(func.coalesce(func.sum(Payment.amount_paise), 0)).filter(Payment.status.in_(["captured", "refunded"])).scalar())
     if topups != captured:

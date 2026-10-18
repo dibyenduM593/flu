@@ -7,6 +7,7 @@ DB = Path(__file__).parent / "_test.db"
 os.environ["DATABASE_URL"] = f"sqlite:///{DB}"
 os.environ["FLU_WORKER"] = "0"
 os.environ["FLU_AI_MODE"] = "heuristic"
+os.environ["FLU_SKIP_DOTENV"] = "1"  # a developer's backend/.env (e.g. INSTAGRAM_MODE=live) must not leak into tests
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest  # noqa: E402
